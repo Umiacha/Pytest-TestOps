@@ -20,7 +20,7 @@ wheels = [
 [[package]]
 name = "demo-algorithms"
 version = "0.1.0"
-source = { editable = "demo-project/demo-algorithms" }
+source = { editable = "demo-projects/demo-algorithms" }
 dependencies = [
     { name = "pytest" },
     { name = "pytest-testops" },

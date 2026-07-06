@@ -15,5 +15,5 @@ build-backend = "uv_build"
 
 [tool.uv.workspace]
 members = [
-    "demo-project/demo-algorithms",
+    "demo-projects/demo-algorithms",
 ]
