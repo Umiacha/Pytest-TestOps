@@ -12,8 +12,6 @@ PHASES = ("setup", "call", "teardown")
 
 @dataclass(frozen=True)
 class PhaseMetric:
-    """Метрики одной фазы одного test item."""
-
     outcome: str
     duration: float
     start: float
@@ -22,12 +20,6 @@ class PhaseMetric:
 
 @dataclass
 class TestItemMetric:
-    """Метрики одного конкретного pytest Item.
-
-    Например:
-        tests/test_algo.py::test_sort[10]
-    """
-
     nodeid: str
     group_nodeid: str
     name: str
@@ -47,29 +39,47 @@ class TestOpsTimingPlugin:
         self.items: dict[str, TestItemMetric] = {}
         self.groups: dict[str, list[str]] = {}
 
-    def pytest_collection_modifyitems(  # TODO: т.к. вызывается до pytest_deselected, то м.б. и лучше уж pytest_collection_finish использовать?
-        self,
-        session: pytest.Session,
-        config: pytest.Config,
-        items: list[pytest.Item],
-    ) -> None:
-        """Вызывается, когда все тесты были найдены, но еще не исключались фильтрами."""
-        print(f"[testops] collected {len(items)} item(s)")
+        # Items, которые мы намеренно не включаем в метрики.
+        self.excluded_nodeids: set[str] = set()
+        self.exclude_reasons: dict[str, str] = {}
 
-        for item in items:
+    def pytest_collection_finish(self, session: pytest.Session) -> None:
+        print(f"[testops] collection finished: {len(session.items)} item(s)")
+
+        for item in session.items:
+            if self._is_unconditional_skip(item):
+                self._exclude_item(
+                    nodeid=item.nodeid,
+                    reason="@pytest.mark.skip",
+                )
+                print(f"[testops] exclude static skipped item: {item.nodeid}")
+                continue
+
             self._register_item(item)
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
-        """Вызывается после каждого этапа из PHASES. Содержит результат прохождения теста."""
         if report.when not in PHASES:
+            return
+
+        if report.nodeid in self.excluded_nodeids:
+            return
+
+        if report.outcome == "skipped":
+            self._exclude_item(
+                nodeid=report.nodeid,
+                reason=f"runtime skipped during {report.when}",
+            )
+            print(
+                "[testops] exclude runtime skipped item "
+                f"nodeid={report.nodeid} "
+                f"when={report.when}"
+            )
             return
 
         metric = self.items.get(report.nodeid)
 
         if metric is None:
-            # Такого обычно не должно быть, потому что item должен
-            # быть зарегистрирован на collection phase. Но fallback полезен
-            # для отладки и странных edge cases.
+            # Fallback на случай странного порядка хуков или нестандартного плагина.
             metric = TestItemMetric(
                 nodeid=report.nodeid,
                 group_nodeid=self._fallback_group_nodeid(report.nodeid),
@@ -103,7 +113,11 @@ class TestOpsTimingPlugin:
         nodeid: str,
         location: tuple[str, int | None, str],
     ) -> None:
-        """Вызывается после прохождения всех этапов теста. Т.е. прямо перед переходом к следующему тесту."""
+        if nodeid in self.excluded_nodeids:
+            reason = self.exclude_reasons.get(nodeid, "<unknown>")
+            print(f"[testops] item ignored nodeid={nodeid} reason={reason}")
+            return
+
         metric = self.items.get(nodeid)
 
         if metric is None:
@@ -116,11 +130,12 @@ class TestOpsTimingPlugin:
         session: pytest.Session,
         exitstatus: int,
     ) -> None:
-        """Вызывается, когда все тесты завершены; прямо перед pytest_unconfigure."""
         print()
         print("[testops] session summary")
         print(f"[testops] exitstatus={exitstatus}")
         print(f"[testops] collected={session.testscollected}")
+        print(f"[testops] measured_items={self._measured_items_count()}")
+        print(f"[testops] excluded_items={len(self.excluded_nodeids)}")
         print()
 
         for group_nodeid in self.groups:
@@ -143,26 +158,36 @@ class TestOpsTimingPlugin:
         self.groups.setdefault(group_nodeid, []).append(item.nodeid)
 
         print(
-            "[testops] item "
+            "[testops] register item "
             f"nodeid={metric.nodeid} "
             f"group={metric.group_nodeid} "
             f"param_id={metric.param_id} "
             f"params={metric.params}"
         )
 
+    def _exclude_item(self, nodeid: str, reason: str) -> None:
+        self.excluded_nodeids.add(nodeid)
+        self.exclude_reasons[nodeid] = reason
+
+        metric = self.items.pop(nodeid, None)
+
+        if metric is None:
+            return
+
+        group_nodeids = self.groups.get(metric.group_nodeid, [])
+
+        if nodeid in group_nodeids:
+            group_nodeids.remove(nodeid)
+
+        if not group_nodeids:
+            self.groups.pop(metric.group_nodeid, None)
+
+    @staticmethod
+    def _is_unconditional_skip(item: pytest.Item) -> bool:
+        return item.get_closest_marker("skip") is not None
+
     @staticmethod
     def _extract_param_data(item: pytest.Item) -> tuple[str | None, dict[str, str]]:
-        """Достаем информацию о параметризации, если она есть.
-
-        Для обычного теста:
-            param_id = None
-            params = {}
-
-        Для параметризованного теста:
-            param_id = "10"
-            params = {"n": "10"}
-        """
-
         callspec = getattr(item, "callspec", None)
 
         if callspec is None:
@@ -180,15 +205,6 @@ class TestOpsTimingPlugin:
 
     @staticmethod
     def _build_group_nodeid(item: pytest.Item, param_id: str | None) -> str:
-        """Строим id логического теста без конкретного параметра.
-
-        Было:
-            tests/test_algo.py::test_sort[10]
-
-        Станет:
-            tests/test_algo.py::test_sort
-        """
-
         if param_id is None:
             return item.nodeid
 
@@ -211,16 +227,8 @@ class TestOpsTimingPlugin:
         metric: TestItemMetric,
         report: pytest.TestReport,
     ) -> None:
-        """Определяем итоговый outcome для test item.
-
-        Правила:
-        - если setup failed/skipped, call может не выполниться;
-        - если call прошел/упал/skipped, это основной outcome;
-        - если teardown failed, итоговый item лучше считать failed.
-        """
-
-        if report.when == "setup" and report.outcome in {"failed", "skipped"}:
-            metric.outcome = report.outcome
+        if report.when == "setup" and report.outcome == "failed":
+            metric.outcome = "failed"
             return
 
         if report.when == "call":
@@ -229,6 +237,9 @@ class TestOpsTimingPlugin:
 
         if report.when == "teardown" and report.outcome == "failed":
             metric.outcome = "failed"
+
+    def _measured_items_count(self) -> int:
+        return len(self.items)
 
     @staticmethod
     def _print_item_summary(metric: TestItemMetric) -> None:
@@ -255,7 +266,14 @@ class TestOpsTimingPlugin:
 
     def _print_group_summary(self, group_nodeid: str) -> None:
         nodeids = self.groups[group_nodeid]
-        metrics = [self.items[nodeid] for nodeid in nodeids]
+        metrics = [
+            self.items[nodeid]
+            for nodeid in nodeids
+            if nodeid not in self.excluded_nodeids
+        ]
+
+        if not metrics:
+            return
 
         print(f"[testops] group summary group={group_nodeid}")
         print(f"[testops]   item_count={len(metrics)}")
@@ -304,6 +322,5 @@ class TestOpsTimingPlugin:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """К этому моменту плагин уже инициализирован. Можно внести корректировки в созданный Config."""
     plugin = TestOpsTimingPlugin()
     config.pluginmanager.register(plugin, name="testops-timing-plugin")
