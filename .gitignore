@@ -10,6 +10,10 @@ dist/
 build/
 *.egg-info/
 
+# Data
+.testops
+.testops/*
+
 # Tips
 .dev-tips
 .dev-tips/*

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import json
 import statistics
-from dataclasses import dataclass, field
+import sys
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 
 PHASES = ("setup", "call", "teardown")
+SCHEMA_VERSION = "testops.run.v1"
 
 
 @dataclass(frozen=True)
@@ -34,8 +40,54 @@ class TestItemMetric:
         return sum(phase.duration for phase in self.phases.values())
 
 
+@dataclass(frozen=True)
+class DurationStats:
+    count: int
+    total: float
+    mean: float
+    min: float
+    max: float
+
+
+@dataclass(frozen=True)
+class TestGroupMetric:
+    group_nodeid: str
+    item_nodeids: list[str]
+    item_count: int
+    outcome_counts: dict[str, int]
+    phase_stats: dict[str, DurationStats | None]
+    all_phases_stats: DurationStats | None
+
+
+@dataclass(frozen=True)
+class ExcludedItemMetric:
+    nodeid: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class TestRunMetric:
+    schema_version: str
+    generated_at: str
+    rootpath: str
+    exitstatus: int
+    collected: int
+    measured_items: int
+    excluded_items: list[ExcludedItemMetric]
+    items: list[TestItemMetric]
+    groups: list[TestGroupMetric]
+
+
 class TestOpsTimingPlugin:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        output_path: str | None,
+        rootpath: Path,
+    ) -> None:
+        self.output_path = output_path
+        self.rootpath = rootpath
+
         self.items: dict[str, TestItemMetric] = {}
         self.groups: dict[str, list[str]] = {}
 
@@ -44,15 +96,12 @@ class TestOpsTimingPlugin:
         self.exclude_reasons: dict[str, str] = {}
 
     def pytest_collection_finish(self, session: pytest.Session) -> None:
-        print(f"[testops] collection finished: {len(session.items)} item(s)")
-
         for item in session.items:
             if self._is_unconditional_skip(item):
                 self._exclude_item(
                     nodeid=item.nodeid,
                     reason="@pytest.mark.skip",
                 )
-                print(f"[testops] exclude static skipped item: {item.nodeid}")
                 continue
 
             self._register_item(item)
@@ -68,11 +117,6 @@ class TestOpsTimingPlugin:
             self._exclude_item(
                 nodeid=report.nodeid,
                 reason=f"runtime skipped during {report.when}",
-            )
-            print(
-                "[testops] exclude runtime skipped item "
-                f"nodeid={report.nodeid} "
-                f"when={report.when}"
             )
             return
 
@@ -97,49 +141,34 @@ class TestOpsTimingPlugin:
             start=report.start,
             stop=report.stop,
         )
-
         self._update_item_outcome(metric, report)
-
-        print(
-            "[testops] phase "
-            f"nodeid={report.nodeid} "
-            f"when={report.when} "
-            f"outcome={report.outcome} "
-            f"duration={report.duration:.6f}s"
-        )
-
-    def pytest_runtest_logfinish(
-        self,
-        nodeid: str,
-        location: tuple[str, int | None, str],
-    ) -> None:
-        if nodeid in self.excluded_nodeids:
-            reason = self.exclude_reasons.get(nodeid, "<unknown>")
-            print(f"[testops] item ignored nodeid={nodeid} reason={reason}")
-            return
-
-        metric = self.items.get(nodeid)
-
-        if metric is None:
-            return
-
-        self._print_item_summary(metric)
 
     def pytest_sessionfinish(
         self,
         session: pytest.Session,
         exitstatus: int,
     ) -> None:
-        print()
-        print("[testops] session summary")
-        print(f"[testops] exitstatus={exitstatus}")
-        print(f"[testops] collected={session.testscollected}")
-        print(f"[testops] measured_items={self._measured_items_count()}")
-        print(f"[testops] excluded_items={len(self.excluded_nodeids)}")
-        print()
+        if self.output_path is None:
+            return
 
-        for group_nodeid in self.groups:
-            self._print_group_summary(group_nodeid)
+        report = self._build_session_report(
+            session=session,
+            exitstatus=exitstatus,
+        )
+        payload = json.dumps(
+            asdict(report),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        if self.output_path == "-":
+            sys.stdout.write(payload)
+            sys.stdout.write("\n")
+            return
+
+        output_path = self._resolve_output_path(self.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(payload + "\n", encoding="utf-8")
 
     def _register_item(self, item: pytest.Item) -> None:
         param_id, params = self._extract_param_data(item)
@@ -157,30 +186,109 @@ class TestOpsTimingPlugin:
         self.items[item.nodeid] = metric
         self.groups.setdefault(group_nodeid, []).append(item.nodeid)
 
-        print(
-            "[testops] register item "
-            f"nodeid={metric.nodeid} "
-            f"group={metric.group_nodeid} "
-            f"param_id={metric.param_id} "
-            f"params={metric.params}"
-        )
-
     def _exclude_item(self, nodeid: str, reason: str) -> None:
         self.excluded_nodeids.add(nodeid)
         self.exclude_reasons[nodeid] = reason
 
         metric = self.items.pop(nodeid, None)
-
         if metric is None:
             return
 
         group_nodeids = self.groups.get(metric.group_nodeid, [])
-
         if nodeid in group_nodeids:
             group_nodeids.remove(nodeid)
 
         if not group_nodeids:
             self.groups.pop(metric.group_nodeid, None)
+
+    def _build_session_report(
+        self,
+        *,
+        session: pytest.Session,
+        exitstatus: int,
+    ) -> TestRunMetric:
+        groups: list[TestGroupMetric] = []
+
+        for group_nodeid in self.groups:
+            group_metric = self._build_group_metric(group_nodeid)
+            if group_metric is not None:
+                groups.append(group_metric)
+
+        return TestRunMetric(
+            schema_version=SCHEMA_VERSION,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            rootpath=str(self.rootpath),
+            exitstatus=exitstatus,
+            collected=session.testscollected,
+            measured_items=len(self.items),
+            excluded_items=[
+                ExcludedItemMetric(
+                    nodeid=nodeid,
+                    reason=self.exclude_reasons.get(nodeid, "<unknown>"),
+                )
+                for nodeid in sorted(self.excluded_nodeids)
+            ],
+            items=list(self.items.values()),
+            groups=groups,
+        )
+
+    def _build_group_metric(self, group_nodeid: str) -> TestGroupMetric | None:
+        nodeids = [
+            nodeid
+            for nodeid in self.groups[group_nodeid]
+            if nodeid not in self.excluded_nodeids and nodeid in self.items
+        ]
+        metrics = [self.items[nodeid] for nodeid in nodeids]
+
+        if not metrics:
+            return None
+
+        outcome_counts: dict[str, int] = {}
+        for metric in metrics:
+            outcome = metric.outcome or "<unknown>"
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+
+        phase_stats: dict[str, DurationStats | None] = {}
+
+        for phase_name in PHASES:
+            durations = [
+                metric.phases[phase_name].duration
+                for metric in metrics
+                if phase_name in metric.phases
+            ]
+            phase_stats[phase_name] = self._build_duration_stats(durations)
+
+        total_durations = [metric.total_duration for metric in metrics]
+
+        return TestGroupMetric(
+            group_nodeid=group_nodeid,
+            item_nodeids=nodeids,
+            item_count=len(metrics),
+            outcome_counts=outcome_counts,
+            phase_stats=phase_stats,
+            all_phases_stats=self._build_duration_stats(total_durations),
+        )
+
+    def _resolve_output_path(self, output_path: str) -> Path:
+        path = Path(output_path)
+
+        if path.is_absolute():
+            return path
+
+        return self.rootpath / path
+
+    @staticmethod
+    def _build_duration_stats(durations: list[float]) -> DurationStats | None:
+        if not durations:
+            return None
+
+        return DurationStats(
+            count=len(durations),
+            total=sum(durations),
+            mean=statistics.mean(durations),
+            min=min(durations),
+            max=max(durations),
+        )
 
     @staticmethod
     def _is_unconditional_skip(item: pytest.Item) -> bool:
@@ -194,8 +302,8 @@ class TestOpsTimingPlugin:
             return None, {}
 
         param_id = getattr(callspec, "id", None)
-
         raw_params: dict[str, Any] = getattr(callspec, "params", {})
+
         params = {
             name: repr(value)
             for name, value in raw_params.items()
@@ -238,89 +346,26 @@ class TestOpsTimingPlugin:
         if report.when == "teardown" and report.outcome == "failed":
             metric.outcome = "failed"
 
-    def _measured_items_count(self) -> int:
-        return len(self.items)
 
-    @staticmethod
-    def _print_item_summary(metric: TestItemMetric) -> None:
-        print(f"[testops] item summary nodeid={metric.nodeid}")
-        print(f"[testops]   group={metric.group_nodeid}")
-        print(f"[testops]   outcome={metric.outcome}")
-        print(f"[testops]   param_id={metric.param_id}")
-        print(f"[testops]   params={metric.params}")
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("testops")
 
-        for phase_name in PHASES:
-            phase = metric.phases.get(phase_name)
-
-            if phase is None:
-                print(f"[testops]   {phase_name}: <missing>")
-                continue
-
-            print(
-                f"[testops]   {phase_name}: "
-                f"outcome={phase.outcome} "
-                f"duration={phase.duration:.6f}s"
-            )
-
-        print(f"[testops]   total={metric.total_duration:.6f}s")
-
-    def _print_group_summary(self, group_nodeid: str) -> None:
-        nodeids = self.groups[group_nodeid]
-        metrics = [
-            self.items[nodeid]
-            for nodeid in nodeids
-            if nodeid not in self.excluded_nodeids
-        ]
-
-        if not metrics:
-            return
-
-        print(f"[testops] group summary group={group_nodeid}")
-        print(f"[testops]   item_count={len(metrics)}")
-
-        outcome_counts: dict[str, int] = {}
-
-        for metric in metrics:
-            outcome = metric.outcome or "<unknown>"
-            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
-
-        print(f"[testops]   outcomes={outcome_counts}")
-
-        for phase_name in PHASES:
-            durations = [
-                metric.phases[phase_name].duration
-                for metric in metrics
-                if phase_name in metric.phases
-            ]
-
-            if not durations:
-                print(f"[testops]   {phase_name}: <no data>")
-                continue
-
-            print(
-                f"[testops]   {phase_name}: "
-                f"count={len(durations)} "
-                f"total={sum(durations):.6f}s "
-                f"mean={statistics.mean(durations):.6f}s "
-                f"min={min(durations):.6f}s "
-                f"max={max(durations):.6f}s"
-            )
-
-        totals = [metric.total_duration for metric in metrics]
-
-        if totals:
-            print(
-                f"[testops]   all_phases: "
-                f"count={len(totals)} "
-                f"total={sum(totals):.6f}s "
-                f"mean={statistics.mean(totals):.6f}s "
-                f"min={min(totals):.6f}s "
-                f"max={max(totals):.6f}s"
-            )
-
-        print()
+    group.addoption(
+        "--testops-json-report",
+        action="store",
+        dest="testops_json_report",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write pytest-testops run report to JSON file. "
+            "Use '-' to write JSON to stdout."
+        ),
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    plugin = TestOpsTimingPlugin()
+    plugin = TestOpsTimingPlugin(
+        output_path=config.getoption("testops_json_report"),
+        rootpath=config.rootpath,
+    )
     config.pluginmanager.register(plugin, name="testops-timing-plugin")
