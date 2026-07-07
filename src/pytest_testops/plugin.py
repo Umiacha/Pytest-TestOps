@@ -47,25 +47,27 @@ class TestOpsTimingPlugin:
         self.items: dict[str, TestItemMetric] = {}
         self.groups: dict[str, list[str]] = {}
 
-    def pytest_collection_modifyitems(
+    def pytest_collection_modifyitems(  # TODO: т.к. вызывается до pytest_deselected, то м.б. и лучше уж pytest_collection_finish использовать?
         self,
         session: pytest.Session,
         config: pytest.Config,
         items: list[pytest.Item],
     ) -> None:
+        """Вызывается, когда все тесты были найдены, но еще не исключались фильтрами."""
         print(f"[testops] collected {len(items)} item(s)")
 
         for item in items:
             self._register_item(item)
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        """Вызывается после каждого этапа из PHASES. Содержит результат прохождения теста."""
         if report.when not in PHASES:
             return
 
         metric = self.items.get(report.nodeid)
 
         if metric is None:
-            # Нормально такого обычно не должно быть, потому что item должен
+            # Такого обычно не должно быть, потому что item должен
             # быть зарегистрирован на collection phase. Но fallback полезен
             # для отладки и странных edge cases.
             metric = TestItemMetric(
@@ -101,6 +103,7 @@ class TestOpsTimingPlugin:
         nodeid: str,
         location: tuple[str, int | None, str],
     ) -> None:
+        """Вызывается после прохождения всех этапов теста. Т.е. прямо перед переходом к следующему тесту."""
         metric = self.items.get(nodeid)
 
         if metric is None:
@@ -113,6 +116,7 @@ class TestOpsTimingPlugin:
         session: pytest.Session,
         exitstatus: int,
     ) -> None:
+        """Вызывается, когда все тесты завершены; прямо перед pytest_unconfigure."""
         print()
         print("[testops] session summary")
         print(f"[testops] exitstatus={exitstatus}")
@@ -300,5 +304,6 @@ class TestOpsTimingPlugin:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    """К этому моменту плагин уже инициализирован. Можно внести корректировки в созданный Config."""
     plugin = TestOpsTimingPlugin()
     config.pluginmanager.register(plugin, name="testops-timing-plugin")
