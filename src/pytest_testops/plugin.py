@@ -178,7 +178,7 @@ class TestOpsTimingPlugin:
             nodeid=item.nodeid,
             group_nodeid=group_nodeid,
             name=item.name,
-            path=str(item.path),
+            path=self._to_project_relative_path(item.path),
             param_id=param_id,
             params=params,
         )
@@ -217,7 +217,7 @@ class TestOpsTimingPlugin:
         return TestRunMetric(
             schema_version=SCHEMA_VERSION,
             generated_at=datetime.now(timezone.utc).isoformat(),
-            rootpath=str(self.rootpath),
+            rootpath=".",
             exitstatus=exitstatus,
             collected=session.testscollected,
             measured_items=len(self.items),
@@ -345,6 +345,18 @@ class TestOpsTimingPlugin:
 
         if report.when == "teardown" and report.outcome == "failed":
             metric.outcome = "failed"
+    
+    def _to_project_relative_path(self, path: Path | str) -> str:
+        target = Path(path)
+    
+        try:
+            relative_path = target.resolve().relative_to(self.rootpath.resolve())
+        except ValueError:
+            # Защитный fallback: если pytest item почему-то лежит вне rootpath,
+            # не пишем абсолютный путь в публичный отчет.
+            return target.name
+    
+        return relative_path.as_posix()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
