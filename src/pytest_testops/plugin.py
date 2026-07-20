@@ -209,7 +209,7 @@ class TestOpsTimingPlugin:
     ) -> TestRunMetric:
         groups: list[TestGroupMetric] = []
 
-        for group_nodeid in self.groups:
+        for group_nodeid in sorted(self.groups):
             group_metric = self._build_group_metric(group_nodeid)
             if group_metric is not None:
                 groups.append(group_metric)
@@ -228,7 +228,7 @@ class TestOpsTimingPlugin:
                 )
                 for nodeid in sorted(self.excluded_nodeids)
             ],
-            items=list(self.items.values()),
+            items=sorted(self.items.values(), key=lambda item: item.nodeid),
             groups=groups,
         )
 
@@ -376,6 +376,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    output_path = config.getoption("testops_json_report")
+
+    if output_path is None:  # Если путь не передан, то плагин не подгружается впринципе!
+        return
+
     plugin = TestOpsTimingPlugin(
         output_path=config.getoption("testops_json_report"),
         rootpath=config.rootpath,
