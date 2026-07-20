@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 
@@ -23,3 +25,12 @@ def test_parametrize(nums):
 # @pytest.mark.skip
 # def test_skipped():
 #     assert 1 + 1 == 2
+
+
+@pytest.mark.parametrize("n", [10, 20])
+def test_runtime_skip(n: int) -> None:
+    if n == 20:
+        pytest.skip("skip one parametrization")
+
+    time.sleep(n / 10_000)
+    assert n > 0
